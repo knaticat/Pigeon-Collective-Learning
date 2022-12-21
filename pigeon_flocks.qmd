@@ -1,0 +1,557 @@
+---
+title: "Collective Learning in Pigeon Flocks"
+author: "Shoubhik Banerjee"
+format: 
+  html: 
+    code-fold: false
+    code-tools: true
+    code-link: true
+editor: visual
+execute: 
+  warning: false
+  include: true
+---
+
+Loading the libraries
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(plotly)
+library(geosphere)
+library(ggridges)
+library(ggdist)
+library(viridis)
+library(dtw)
+library(car)
+
+theme_set(theme_bw(base_size = 12))
+```
+
+Load the dataset and clean it.
+
+```{r}
+loadRData <- function(fileName){
+  #loads an RData file, and returns it
+  load(fileName)
+  get(ls()[ls() != "fileName"])
+}
+
+pigeon_gen <- loadRData("data/flightsExperimentalGen2to5.RData")
+selected_release <- loadRData('data/experimentalSelectedReleases.RData')
+
+#arrange the GPS time correctly in order
+
+pigeon_gen <- pigeon_gen |> 
+  group_by(Pair, Release) |> 
+  arrange(Time, .by_group = T)
+
+#select flights withn 250m should result in 343 flights
+pigeon_gen <- pigeon_gen |> 
+  nest() |> 
+  cbind(Within250 = selected_release$Within250) |> 
+  filter(Within250 == 1) |> 
+  select(-Within250)|> 
+  unnest(cols = c(data))
+```
+
+Coordinates of start and end locations
+
+```{r}
+#bletchingdon (Start Site)
+BLX1 <- 51.856616 #latitude
+BLY1 <- -1.284057 #longitude
+
+#wytham (Home Loft)
+BLX2 <- 51.782818 #latitude
+BLY2 <- -1.317334 #longitude
+```
+
+### Quantifying Leadership Across Releases
+
+Find out leadership in each release.
+
+```{r}
+
+pigeon_leader <- pigeon_gen |>
+  #calculate mid points of each bird pair
+  mutate(midpoints_x = (Ex + Nx) / 2) |>
+  mutate(midpoints_y = (Ey + Ny) / 2) |>
+  #calculate leadership angles
+  group_by(Gen, Pair, Release) |>
+  nest() |>
+  #calculate absoulte bearing angle of Exp bird wrt North
+  mutate(abs_angle = map(.x = data, 
+                         .f = ~ bearing(as.matrix(.x[, c('Ey', 'Ex')]),
+                                        as.matrix(.x[, c('Ny', 'Nx')])))) |>
+  #calculate heading angle of the pair
+  mutate(heading = map(.x = data, .f = ~ bearing(as.matrix(.x[, c('midpoints_y', 'midpoints_x')])))) |>
+  unnest(cols = c(data, abs_angle, heading)) |>
+  mutate_at(c("abs_angle", "heading"),
+            ~ replace(., is.na(.), 0)) |>
+  #change from -180, 180 to 0,360 angle range
+  mutate(abs_angle = (abs_angle + 360) %% 360) |>
+  mutate(heading = (heading + 360) %% 360) |>
+  #caclulate relative bearing of Exp wrt to heading direction
+  mutate(rel_angle = abs(180 - abs(heading - abs_angle)))
+
+```
+
+Linearly map the interval of angles \[0,180\] to \[1,-1\]. Here 0 or 1 being Experienced bird more of a leader, while 180 or -1 being Naive bird more of a leader respectively.
+
+```{r}
+# mapping function
+linMap <- function(x, from, to) approxfun(range(x), c(from, to))(x)
+
+pigeon_leader <- pigeon_leader |>
+  group_by(Gen, Pair, Release) |>
+  #map the intervals here
+  mutate(leadership_E = linMap(rel_angle, 1,-1)) |>
+  #calculate most frequent leadership state of the release 
+  mutate(freq_leadership = density(leadership_E)$x[which.max(density(leadership_E)$y)]) |>
+  #calculate mean leadership of the release
+  mutate(mean_leadership = mean(leadership_E))
+```
+
+Plot of density distribution of leadership for a pair.
+
+```{r}
+pigeon_leader |> 
+  filter(Gen == 2, Pair == 1) |> 
+  ggplot(aes(x = leadership_E, y = Release, group = Release, fill = as.factor(Release))) +
+  geom_density_ridges(alpha = 0.6) +
+  geom_point(aes(x = mean_leadership)) +
+  #geom_point(aes(x = freq_leadership), color = 'red') +
+  labs(x = 'Leadership Coefficient', y = 'Release', fill = 'Release')
+
+pigeon_leader |> 
+  ggplot(aes(x = leadership_E, y = Gen, group = Gen, fill = as.factor(Gen))) +
+  geom_density_ridges(alpha = 0.6) +
+  labs(x = 'Leadership Coefficient', y = 'Generation', fill = 'Generation')
+```
+
+Interactive visualization of trajectory for each pigeon.
+
+```{r}
+
+color <- viridis(25)
+p <- pigeon_gen |>
+  #group_by(Pair, Release) |>
+  filter(Gen == 2, Pair == 1) |>
+  arrange(Time, .by_group = T) |>
+  ggplot(aes(
+    x = Ey,
+    y = Ex
+  )) +
+  geom_point(shape = 1, size = 0.5, alpha = 0.2, color = color[2]) +
+  geom_point(aes(x = Ny, y = Nx),size = 0.2, shape = 4, color = color[16]) +
+  scale_color_viridis() +
+  #ggplot(aes(y = midpoints_x, x = midpoints_y,color = as.factor(Release))) +
+  # geom_point(size = 0.5) +
+  geom_point(aes(y = BLX1, x = BLY1), size = 1, color = 'orange') +
+  geom_point(aes(y = BLX2, x = BLY2), size = 1, color = 'black') +
+  labs(title = "Exp and Naive Tracks across Releases",
+       x = "longitude",
+       y = "latitude",
+       fill = "Release")
+
+ggplotly(p)
+```
+
+### Quantifying Performance
+
+Calculate distance of each data point from origin.
+
+```{r}
+#distance of experienced from origin
+distance_origin_exp <- distVincentyEllipsoid(cbind(BLY1, BLX1),
+                                             cbind(pigeon_gen$Ey, pigeon_gen$Ex))
+
+#distance of naive from origin
+distance_origin_naive <- distVincentyEllipsoid(cbind(BLY1, BLX1),
+                                               cbind(pigeon_gen$Ny, pigeon_gen$Nx))
+
+#average distance from origin 
+distance_origin_avg <- rowMeans(cbind(distance_origin_exp, distance_origin_naive))
+
+#beeline distance, calculated by subtracting 1000m (the cutoff radii for each start and finish locations) from actual beeline distance.
+beeline <- distVincentyEllipsoid(cbind(BLY2, BLX2), cbind(BLY1, BLX1)) - 1000
+```
+
+Calculate distance between successive time points of Exp and Naive birds respectively.
+
+```{r}
+# calculate distance
+pigeon_distance <- pigeon_gen |> 
+  group_by(Gen, Pair, Release) |> 
+  cbind(distance_origin_naive = distance_origin_naive, 
+        distance_origin_exp = distance_origin_exp, 
+        distance_origin_avg = distance_origin_avg) |> #bind the origin distances
+#  arrange(distance_origin_avg, .by_group = T) |>  #reorder columns according to origin FOR
+ # arrange(desc(Time), .by_group = T) |> 
+  #calculate distance between consecutive times
+  mutate(distance_exp = distVincentyEllipsoid(cbind(Ey, Ex),
+                                              cbind(lag(Ey), lag(Ex)))) |> 
+  mutate(distance_naive = distVincentyEllipsoid(cbind(Ny, Nx),
+                                                cbind(lag(Ny), lag(Nx)))) |>
+  mutate(distance_avg = rowMeans(cbind(distance_exp, distance_naive))) |> 
+  mutate_at(c("distance_exp", "distance_naive", "distance_avg"),
+            ~replace(., is.na(.), 0)) 
+```
+
+Cut off according to homing ranges.
+
+```{r}
+
+dist_se <- distVincentyEllipsoid(cbind(BLY2, BLX2), cbind(BLY1, BLX1))
+num_cut <- 3
+cutoff_rad <- seq(0, dist_se, dist_se/num_cut)
+
+beeline_cut <- rep(dist_se/num_cut, num_cut)
+
+pigeon_cut <- pigeon_distance|> 
+  group_by(Gen, Pair, Release) |> 
+  mutate(ID = row_number()) |> 
+  cbind(home_range = 
+          findInterval(pigeon_distance$distance_origin_avg, cutoff_rad)) |> 
+  group_by(Gen, Pair, Release, home_range) |> 
+  mutate(idx = cumsum(diff(c(-Inf, ID)) != 1) - 1) |> 
+  mutate(home_range = ifelse(idx != 0, home_range + 1, home_range))
+
+color <- viridis(25)
+p <- pigeon_cut |>
+  #group_by(Pair, Release) |>
+  filter(Gen == 2, Pair == 1,  home_range == 3) |>
+  arrange(Time, .by_group = T) |>
+  ggplot(aes(
+    x = Ey,
+    y = Ex
+  )) +
+  geom_point(shape = 1, size = 0.5, alpha = 0.2, color = color[2]) +
+  geom_point(aes(x = Ny, y = Nx),size = 0.2, shape = 4, color = color[16]) +
+  scale_color_viridis() +
+  #ggplot(aes(y = midpoints_x, x = midpoints_y,color = as.factor(Release))) +
+  # geom_point(size = 0.5) +
+  geom_point(aes(y = BLX1, x = BLY1), size = 1, color = 'orange') +
+  geom_point(aes(y = BLX2, x = BLY2), size = 1, color = 'black') +
+  labs(title = "Exp and Naive Tracks across Releases",
+       x = "longitude",
+       y = "latitude",
+       fill = "Release")
+
+#ggplotly(p)
+
+pigeon_cut <- pigeon_cut |> 
+  group_by(Gen, Pair, Release, home_range) |> 
+  mutate(sum_exp = sum(distance_exp)) |> 
+  mutate(sum_naive = sum(distance_naive)) |> 
+  mutate(sum_avg = sum(distance_avg)) |> 
+  ungroup()
+```
+
+Now plot the range cuts with route efficiency spread.
+
+```{r}
+temp <-  pigeon_cut |> 
+  select(Pair, Release, Gen, home_range, sum_avg) |> 
+  group_by(Pair, Release, Gen, home_range, sum_avg) |> 
+  summarise()|> 
+  mutate(sum_avg = case_when(home_range == 1 ~ sum_avg + 500, 
+                                home_range == num_cut ~ sum_avg + 500,
+                                home_range != 1 && num_cut ~ sum_avg)) |> 
+  
+  mutate(route_efficiency = beeline_cut[unique(home_range)]/ sum_avg) |> 
+ 
+  filter(home_range %in% seq(1,num_cut), route_efficiency < 1, route_efficiency > 0) 
+
+temp |> 
+  ggplot(aes(x = as.factor(home_range), y = route_efficiency)) +
+  geom_point(aes(color = as.factor(home_range))) +
+  stat_summary(fun.data = "mean_se", color = "red", width = 0.2) +
+  labs(x = 'Range Segment', y = 'Route Efficiency', color = 'Range Segment') +
+  scale_x_discrete(breaks = c(1, 2, 3), 
+                     labels = c("start", "mid", "end"))+ theme(legend.position="none")
+
+
+pigeon_model <- lm(route_efficiency ~ home_range, data = temp)
+car::Anova(pigeon_model, type = 2) 
+
+```
+
+Sum up the individual track lengths for the entire route.
+
+```{r}
+pigeon_distance <- pigeon_distance |> 
+  group_by(Gen, Pair, Release) |> 
+  mutate(sum_exp = sum(distance_exp)) |> 
+  mutate(sum_naive = sum(distance_naive)) |> 
+  mutate(sum_avg = sum(distance_avg)) |> 
+  ungroup() 
+
+```
+
+Calculate Route Efficiency
+
+```{r}
+pigeon_data <- pigeon_distance |> 
+  group_by(Gen, Pair, Release, sum_avg) |> 
+  summarise() |> 
+  ungroup() |> 
+  mutate(route_efficiency = beeline / sum_avg) |> 
+  group_by(Gen, Release) |> 
+  mutate(se_route_efficiency = sd(route_efficiency)/sqrt(n())) |> 
+  mutate(route_efficiency = mean(route_efficiency)) 
+
+
+```
+
+Plot the Route Efficiency across generations
+
+```{r}
+pigeon_data |> 
+  ggplot(aes(x = as.factor(Release), y = route_efficiency, 
+             color = as.factor(Gen))) +
+  geom_line(aes(group = 1)) +
+  geom_errorbar(aes(ymin = route_efficiency - se_route_efficiency, 
+                    ymax = route_efficiency + se_route_efficiency),
+                color = 'grey') +
+  geom_point() +
+  facet_wrap(vars(Gen), ncol = 4, nrow = 1) +
+  labs(x = 'Release', y = 'Route efficiency', color = 'Generation', 
+       title = 'Route Efficiency across Generations')
+
+```
+
+Trajectory Similarity
+
+```{r}
+pigeon_exp <- pigeon_gen |> 
+  group_by(Gen, Pair, Release) |> 
+  mutate(midpoints_x = (Ex + Nx)/2) |> 
+  mutate(midpoints_y = (Ey + Ny)/2) |> 
+  nest() 
+
+
+similar_track <- tibble()
+
+similarity <- function(f1,f2) {
+  dtw(f1, f2, step.pattern=symmetric2)$normalizedDistance
+}
+
+for(i in seq(1, nrow(pigeon_exp)-1)){
+  f1 = cbind(pigeon_exp$data[[i]]$midpoints_x, pigeon_exp$data[[i]]$midpoints_y)
+  f2 = cbind(pigeon_exp$data[[i+1]]$midpoints_x, pigeon_exp$data[[i+1]]$midpoints_y)
+  similar = similarity(f1, f2)
+  similar_track <- rbind(similar_track, cbind(traj1 = pigeon_exp$Release[i],
+                      traj2 = pigeon_exp$Release[i+1], simtrack = similar, 
+                      pair = pigeon_exp$Pair[i + 1],
+                      gen = pigeon_exp$Gen[i + 1]))
+}
+
+```
+
+Group by Release pairs and find the mean similarity across flights.
+
+```{r}
+similar_track <- similar_track |> 
+  mutate(simtrack = simtrack*10**5) |> 
+  group_by(gen, traj2) |> 
+  mutate(avg_simtrack = mean(simtrack)) |> 
+  mutate(se_simtrack = sd(simtrack)/sqrt(n()))
+```
+
+Plot the similarity measure across releases.
+
+```{r}
+similar_track |> 
+  ggplot(aes(x = as.factor(traj2), y = avg_simtrack, color = as.factor(gen))) +
+  geom_line(aes(group = 1)) +
+  geom_errorbar(aes(ymin = avg_simtrack - se_simtrack, 
+                    ymax = avg_simtrack + se_simtrack),
+                color = 'grey') +
+  geom_point() +
+  facet_wrap(vars(gen), ncol = 4, nrow = 1) +
+  labs(x = 'Release', y = 'Sim Index', color = 'Generation', 
+       title = 'Similarity Measure across Generations')
+```
+
+### Taking a different approach by just looking at 3 flight triplicates.
+
+```{r}
+avg_leader <- pigeon_leader |>
+  group_by(Gen, Pair, Release) |> 
+  summarise(avg_leader = mean(leadership_E)) |> 
+  ungroup() |> 
+  select(avg_leader)
+
+freq_leader <- pigeon_leader |> 
+  group_by(Gen, Pair, Release, freq_leadership) |> 
+  summarise() |> 
+  ungroup() |> 
+  select(freq_leadership)
+
+pigeon_data <- pigeon_data |> 
+  select(Gen, Pair, Release, sum_avg) |> 
+  add_column(avg_leader) |> 
+  add_column(freq_leader) |> 
+  mutate(route_efficiency = beeline / sum_avg) |> 
+  select(-sum_avg) 
+
+#Checking for neutral states
+#pigeon_data <- pigeon_data |> 
+#  mutate(state = across(avg_leader, cut,
+#                        c(1, 0.05, -0.05, -1), c('N', 'O', 'E')))
+
+#pigeon_data <- mutate(pigeon_data, state = state$avg_leader)
+```
+
+```{r}
+
+triplicates <- tibble()
+
+data_generator <- function(pigeon) {
+  for (i in seq(1:(nrow(pigeon) - 1))) {
+    del_L = pigeon$avg_leader[i + 1] - pigeon$avg_leader[i]
+    del_P = pigeon$route_efficiency[i + 1] - pigeon$route_efficiency[i]
+    
+    #######
+    ##state = ''
+    #if(pigeon$state[i] == pigeon$state[i+1]){
+    # state = 'Maintained'
+    #} else{
+    #  state = 'Changed'
+    #}
+    
+    triplicates <-
+      rbind(
+        triplicates,
+        tibble(
+          pair = pigeon$Pair[i + 1],
+          gen = pigeon$Gen[i + 1],
+          traj1 = pigeon$Release[i],
+          traj2 = pigeon$Release[i + 1],
+          del_L = as.numeric(del_L),
+          del_P = as.numeric(del_P),
+          #state = state
+        )
+      )
+  }
+  return(triplicates)
+}
+
+triplicates <- data_generator(pigeon_data)
+
+
+pigeon_summary <- tibble()
+
+plot_table_data <- function(triplets) {
+  for (i in seq(1:(nrow(triplets) - 1))) {
+    ratio = triplets$del_L[i] / triplets$del_L[i + 1]
+    state = ''
+    if(ratio >= 0){
+      state = 'Maintained'
+    } else{
+      state = 'Changed'
+    }
+    #state = triplets$state[i]
+    perf_prior = triplets$del_P[i]
+    performance_prior = ''
+    if(perf_prior >= 0){
+      performance_prior = 'Increase'
+    } else{
+      performance_prior = 'Decrease'
+    }
+    perf_post = triplets$del_P[i + 1]
+    performance_post = ''
+    if(perf_post >= 0){
+      performance_post = 'Increase'
+    } else{
+      performance_post = 'Decrease'
+    }
+    
+    if(triplets$traj1[i] == triplets$traj2[i] - 1 && 
+       triplets$traj1[i + 1] == triplets$traj2[i + 1] - 1){
+      cont = 1
+    }else{
+      cont = 0
+    }
+    pigeon_summary <-
+      rbind(pigeon_summary,
+            tibble(
+              gen = triplets$gen[i + 1],
+              F1 = triplets$traj1[i], 
+              F2 = triplets$traj2[i], 
+              F3 = triplets$traj2[i + 1],
+              cont = cont,
+              perf_prior = as.numeric(perf_prior),
+              perf_post = as.numeric(perf_post),
+              ratio = as.numeric(ratio),
+              state = state,
+              performance_prior = performance_prior, 
+              performance_post = performance_post
+              
+            ))
+  }
+  return(pigeon_summary)
+}
+
+pigeon_summary <- plot_table_data(triplicates)
+
+# filter consecutive releases only
+pigeon_consecutive <- pigeon_summary |> 
+  filter(cont == 1)
+
+
+
+
+counter <- function(dataset){
+  prior <- 
+    with(dataset,
+         aggregate(
+           list(count_prior = performance_prior),
+           by = list(state_prior = state, performance_prior = performance_prior),
+           FUN = length
+         ))
+  post <- 
+    with(dataset,
+         aggregate(
+           list(count_post = performance_post),
+           by = list(state_post = state, performance_post = performance_post),
+           FUN = length
+         ))
+  
+  return(cbind(prior, post))
+  
+}
+
+
+#filter for triplicates where the posterior flight pair had higher performance
+pigeon_visual <- pigeon_consecutive|> 
+  filter(performance_post == 'Increase') |> 
+  counter()
+
+ggplot(pigeon_visual,
+       aes(x = performance_prior, y = state_prior, fill = count_prior)) +
+  geom_tile() + scale_fill_viridis() +
+  geom_text(aes(label = count_prior)) +
+  labs(x = 'Performance Prior Pair', y = 'Overall State Dynamic', fill = 'Count', 
+       title = 'Posterior flight better Performing (Consecutive Flights)')
+
+```
+
+### Performing Chi Square, Fisher's exact and Barnard's exact test
+
+```{r}
+library(Barnard)
+
+pigeon_interest <- pigeon_consecutive |> 
+  filter(performance_post == 'Increase') 
+
+cont_tab <- table(pigeon_interest$state, pigeon_interest$performance_prior)
+cont_tab
+
+chisq.test(cont_tab)
+fisher.test(cont_tab)
+bt <- barnard.test(39, 27, 28, 15)
+
+```
